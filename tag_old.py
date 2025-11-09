@@ -9,11 +9,14 @@ import os, os.path, datetime
 from typing import Callable, Tuple, Union
 
 import torch, torch.backends.mps
+from corpus import TaggedCorpus
+from lexicon import build_lexicon                  
 from eval import model_cross_entropy, viterbi_error_rate, write_tagging, log as eval_log
 from hmm import HiddenMarkovModel
 from crf import ConditionalRandomField
-# from lexicon import build_lexicon
-from corpus import TaggedCorpus
+from crf_neural import ConditionalRandomFieldNeural
+
+log = logging.getLogger(Path(__file__).stem)  # For usage, see findsim.py in earlier assignment.
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -400,4 +403,3 @@ def main() -> None:
     
 if __name__ == "__main__":
     main()
-

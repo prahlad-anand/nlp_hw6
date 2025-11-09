@@ -144,36 +144,37 @@ class HiddenMarkovModel:
         The `λ` parameter will be used for add-λ smoothing.
         We respect structural zeroes ("don't guess when you know")."""
 
-        e = 1e-15  # Add a small epsilon for stability
+        # we should have seen no emissions from BOS or EOS tags
+        assert self.B_counts[self.eos_t:self.bos_t, :].any() == 0, 'Your expected emission counts ' \
+                'from EOS and BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
 
-        # Emission matrix B
-        numerator_B = self.B_counts + λ
-        numerator_B[self.eos_t, :] = 0
-        numerator_B[self.bos_t, :] = 0
-        denominator_B = numerator_B.sum(dim=1, keepdim=True) + e
-        self.B = numerator_B / denominator_B
+        # Update emission probabilities (self.B).
+        self.B_counts += λ          # smooth the counts (EOS_WORD and BOS_WORD remain at 0 since they're not in the matrix)
+        self.B = self.B_counts / self.B_counts.sum(dim=1, keepdim=True)  # normalize into prob distributions
+        self.B[self.eos_t, :] = 0   # replace these nan values with structural zeroes, just as in init_params
         self.B[self.bos_t, :] = 0
-        self.B[self.eos_t, :] = 0
 
-        # Transition matrix A
-        if self.unigram:
-            total_counts_t = self.A_counts.sum(dim=0) + λ
-            total_counts_t[self.bos_t] = 0
-            denominator_A = total_counts_t.sum() + e
-            p_t = total_counts_t / denominator_A
-            self.A = p_t.unsqueeze(0).repeat(self.k, 1)
-        else:
-            numerator_A = self.A_counts + λ
-            numerator_A[:, self.bos_t] = 0
-            denominator_A = numerator_A.sum(dim=1, keepdim=True) + e
-            self.A = numerator_A / denominator_A
-            self.A[:, self.bos_t] = 0  
-
-        # Update transition probabilities (self.A).  
+        # we should have seen no "tag -> BOS" or "BOS -> tag" transitions
+        assert self.A_counts[:, self.bos_t].any() == 0, 'Your expected transition counts ' \
+                'to BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
+        assert self.A_counts[self.eos_t, :].any() == 0, 'Your expected transition counts ' \
+                'from EOS are not all zero, meaning you\'ve accumulated them incorrectly!'
+                
+        # Update transition probabilities (self.A).
         # Don't forget to respect the settings self.unigram and λ.
         # See the init_params() method for a discussion of self.A in the
         # unigram case.
-        
+
+        if self.unigram:
+            unigram_counts = self.A_counts.sum(dim=0, keepdim=True)
+            unigram_counts += λ
+            unigram_counts[:, self.bos_t] = 0
+            self.A = unigram_counts / unigram_counts.sum(dim=1, keepdim=True) 
+            self.A = self.A.repeat(self.k, 1)  # repeat to create k x k matrix
+        else:
+            self.A_counts += λ
+            self.A_counts[:, self.bos_t] = 0
+            self.A = self.A_counts / self.A_counts.sum(dim=1, keepdim=True)  
 
     def _zero_counts(self):
         """Set the expected counts to 0.  
@@ -211,8 +212,7 @@ class HiddenMarkovModel:
             # regrettably turn the entire sum into nan.      
 
         self._save_time = time.time()      # mark start of training     
-        dev_loss = loss(self)   # evaluate the model at the start of training
-        
+        dev_loss = loss(self)              # evaluate the model at the start of training
         old_dev_loss: float = dev_loss     # loss from the last epoch
         steps: int = 0   # total number of sentences the model has been trained on so far      
         while steps < max_steps:
@@ -236,7 +236,7 @@ class HiddenMarkovModel:
 
             # M step: Update the parameters based on the accumulated counts.
             self.M_step(λ)
-            # if save_path: self.save(save_path, checkpoint=steps)  # save incompletely trained model in case we crash
+            if save_path: self.save(save_path, checkpoint=steps)  # save incompletely trained model in case we crash
             
             # Evaluate with the new parameters
             dev_loss = loss(self)   # this will print its own log messages
@@ -283,14 +283,14 @@ class HiddenMarkovModel:
         
         When the logging level is set to DEBUG, the alpha and beta vectors and posterior counts
         are logged.  You can check this against the ice cream spreadsheet."""
-        
+
         # Forward-backward algorithm.
         log_Z_forward = self.forward_pass(isent)
         log_Z_backward = self.backward_pass(isent, mult=mult)
-
+        
         # Check that forward and backward passes found the same total
         # probability of all paths (up to floating-point error).
-        assert torch.isclose(log_Z_forward, log_Z_backward, atol=1e-6), f"backward log-probability {log_Z_backward} doesn't match forward log-probability {log_Z_forward}!"
+        assert torch.isclose(log_Z_forward, log_Z_backward), f"backward log-probability {log_Z_backward} doesn't match forward log-probability {log_Z_forward}!"
 
     @typechecked
     def forward_pass(self, isent: IntegerizedSentence) -> TorchScalar:
@@ -302,55 +302,43 @@ class HiddenMarkovModel:
         As a side effect, remember the alpha probabilities and log_Z
         (store some representation of them into attributes of self)
         so that they can subsequently be used by the backward pass."""
-    
-        n = len(isent)
-        k = self.k
+        
+       
+        log_alpha = [torch.empty(self.k) for _ in isent]
+        log_alpha[0] = torch.full((self.k,), -inf)
+        log_alpha[0][self.bos_t] = 0.0
 
-        log_pA = torch.log(self.A + 1e-10)  
-        log_pB = torch.log(self.B + 1e-10)
+        #
+        for j in range(1, len(isent)):
+            word_j, tag_j = isent[j]
 
-        log_alpha = torch.full((n, k), float('-inf'))
-        log_alpha[0, self.bos_t] = 0.0
-
-        tau_mask = torch.ones((n, k), dtype=torch.bool)
-        for j in range(n):
-            if isent[j][1] is not None:
-                t_j = isent[j][1]
-                tau_mask[j] = False
-                tau_mask[j, t_j] = True
-
-        log_pB_wj = torch.full((n, k), float('-inf'))
-        for j in range(n):
-            w_j = isent[j][0]
-            if w_j < self.V:
-                log_pB_wj[j] = log_pB[:, w_j]
+            if word_j >= self.V:
+                if word_j == self.V:  
+                    
+                    log_emission = torch.full((self.k,), -inf)
+                    log_emission[self.eos_t] = 0.0
+                else:  
+                    log_emission = torch.full((self.k,), -inf)
+                    log_emission[self.bos_t] = 0.0
             else:
-                if w_j == self.vocab.index(BOS_WORD):
-                    log_pB_wj[j, self.bos_t] = 0.0
-                elif w_j == self.vocab.index(EOS_WORD):
-                    log_pB_wj[j, self.eos_t] = 0.0
+                log_emission = torch.log(self.B[:, word_j] + 1e-10)  
 
-        log_pB_wj[~tau_mask] = float('-inf')
+          
+            log_alpha[j] = torch.full((self.k,), -inf)
+            for t in range(self.k):
+                if tag_j is not None and t != tag_j:
+                    continue  
+                
+                log_scores = log_alpha[j-1] + torch.log(self.A[:, t] + 1e-10) + log_emission[t]
+                log_alpha[j][t] = torch.logsumexp(log_scores, dim=0)
 
-        for j in range(1, n):
-            prev_alpha = log_alpha[j - 1].unsqueeze(1)  
-            scores = prev_alpha + log_pA  
-            scores += log_pB_wj[j].unsqueeze(0)  
+        log_Z = log_alpha[-1][self.eos_t]
 
-            mask = tau_mask[j - 1].unsqueeze(1) & tau_mask[j].unsqueeze(0)  
-
-            scores[~mask] = float('-inf')
-
-            log_alpha[j] = torch.logsumexp(scores, dim=0)
-
-            log_alpha[j][~tau_mask[j]] = float('-inf')
-
-        log_Z = log_alpha[-1, self.eos_t]
         self.log_alpha = log_alpha
+        self.alpha = [torch.exp(la) for la in log_alpha]  
         self.log_Z = log_Z
 
         return log_Z
-
 
     @typechecked
     def backward_pass(self, isent: IntegerizedSentence, mult: float = 1) -> TorchScalar:
@@ -362,64 +350,68 @@ class HiddenMarkovModel:
         mult) into self.A_counts and self.B_counts.  These depend on the alpha
         values and log Z, which were stored for us (in self) by the forward
         pass."""
-    
-        n = len(isent) 
-        k = self.k
 
-        log_pA = torch.log(self.A + 1e-10)
-        log_pB = torch.log(self.B + 1e-10)
+        log_beta = [torch.empty(self.k) for _ in isent]
+        log_beta[-1] = torch.full((self.k,), -inf)
+        log_beta[-1][self.eos_t] = 0.0
 
-        log_beta = torch.full((n, k), float('-inf'))
-        log_beta[-1, self.eos_t] = 0.0 
+        log_alpha = self.log_alpha
+        log_Z = self.log_Z
 
-        tau_mask = torch.ones((n, k), dtype=torch.bool)
-        for j in range(n):
-            if isent[j][1] is not None:
-                t_j = isent[j][1]
-                tau_mask[j] = False
-                tau_mask[j, t_j] = True
+        for j in range(len(isent) - 1, 0, -1):
+            word_j, tag_j = isent[j]
 
-        log_pB_wj = torch.full((n, k), float('-inf'))
-        for j in range(n):
-            w_j = isent[j][0]
-            if w_j < self.V:
-                log_pB_wj[j] = log_pB[:, w_j]
+            if tag_j is not None:
+                possible_tags_j = [tag_j]
+        
+                saved_value = log_beta[j][tag_j]
+                log_beta[j] = torch.full((self.k,), -inf)
+                log_beta[j][tag_j] = saved_value
             else:
-                if w_j == self.vocab.index(BOS_WORD):
-                    log_pB_wj[j, self.bos_t] = 0.0
-                elif w_j == self.vocab.index(EOS_WORD):
-                    log_pB_wj[j, self.eos_t] = 0.0
+                possible_tags_j = range(self.k)
 
-        log_pB_wj[~tau_mask] = float('-inf')
+            if word_j >= self.V:
+                if word_j == self.V:  
+                    log_emission = torch.full((self.k,), -inf)
+                    log_emission[self.eos_t] = 0.0
+                else:  
+                    log_emission = torch.full((self.k,), -inf)
+                    log_emission[self.bos_t] = 0.0
+            else:
+                log_emission = torch.log(self.B[:, word_j] + 1e-10)
 
-        for j in range(n - 2, -1, -1):
-            next_beta = log_beta[j + 1]  
-            next_beta[~tau_mask[j + 1]] = float('-inf')
+            if word_j < self.V:
+                for t in possible_tags_j:
+                    if t == self.eos_t or t == self.bos_t:
+                        continue
+                    log_posterior = log_alpha[j][t] + log_beta[j][t] - log_Z
+                    posterior = torch.exp(torch.clamp(log_posterior, max=0))
+                    self.B_counts[t, word_j] += mult * posterior
 
-            scores = log_pA + log_pB_wj[j + 1].unsqueeze(0) + next_beta.unsqueeze(0)  
+            log_beta[j-1] = torch.full((self.k,), -inf)
+            for s in range(self.k):
+                if s == self.eos_t:
+                    continue
+                    
+                log_scores = []
+                for t in possible_tags_j:
+                    if t == self.bos_t:
+                        continue
+                    log_score = torch.log(self.A[s, t] + 1e-10) + log_emission[t] + log_beta[j][t]
+                    log_scores.append(log_score)
+                
+                if log_scores:
+                    log_beta[j-1][s] = torch.logsumexp(torch.stack(log_scores), dim=0)
+                
+                for t in possible_tags_j:
+                    if t == self.bos_t:
+                        continue
+                    log_posterior = log_alpha[j-1][s] + torch.log(self.A[s, t] + 1e-10) + log_emission[t] + log_beta[j][t] - log_Z
+                    posterior = torch.exp(torch.clamp(log_posterior, max=0))
+                    self.A_counts[s, t] += mult * posterior
 
-            mask = tau_mask[j].unsqueeze(1) & tau_mask[j + 1].unsqueeze(0) 
+        log_Z_backward = log_beta[0][self.bos_t]
 
-            scores[~mask] = float('-inf')
-
-            log_beta[j] = torch.logsumexp(scores, dim=1)
-
-            log_beta[j][~tau_mask[j]] = float('-inf')
-
-            alpha_j = self.log_alpha[j].unsqueeze(1)  
-            beta_jp1 = log_beta[j + 1].unsqueeze(0)   
-            xi_scores = alpha_j + log_pA + log_pB_wj[j + 1].unsqueeze(0) + beta_jp1 - self.log_Z
-
-            xi_scores[~mask] = float('-inf')
-
-            xi_probs = torch.exp(xi_scores)  
-
-            self.A_counts += xi_probs * mult
-            w_jp1 = isent[j + 1][0]
-            if w_jp1 < self.V:
-                self.B_counts[:, w_jp1] += xi_probs.sum(dim=0) * mult
-
-        log_Z_backward = log_beta[0, self.bos_t]
         return log_Z_backward
 
     def viterbi_tagging(self, sentence: Sentence, corpus: TaggedCorpus) -> Sentence:
@@ -427,45 +419,44 @@ class HiddenMarkovModel:
         current model."""
 
         isent = self._integerize_sentence(sentence, corpus)
-        n = len(isent) - 1
-        k = self.k
 
-        alpha = [torch.full((k,), float('-inf')) for _ in isent]
-        backpointers = [torch.zeros(k, dtype=torch.long) for _ in isent]
+        log_alpha = [torch.empty(self.k) for _ in isent]
+        backpointers = [torch.empty(self.k, dtype=torch.int) for _ in isent]
+        tags: List[int] = [0] * len(isent)
 
-        log_A = torch.log(self.A + 1e-10)
-        log_B = torch.log(self.B + 1e-10)
+        log_alpha[0] = torch.full((self.k,), -inf)
+        log_alpha[0][self.bos_t] = 0.0
 
-        alpha[0][self.bos_t] = 0.0
         for j in range(1, len(isent)):
-            w_j = isent[j][0]
-            if w_j < self.V:
-                emit_prob = log_B[:, w_j]
+            word_j, tag_j = isent[j]
+
+            if word_j >= self.V:
+                if word_j == self.V:  
+                    log_emission = torch.full((self.k,), -inf)
+                    log_emission[self.eos_t] = 0.0
+                else:  
+                    log_emission = torch.full((self.k,), -inf)
+                    log_emission[self.bos_t] = 0.0
             else:
-                emit_prob = torch.zeros(k)
+                log_emission = torch.log(self.B[:, word_j] + 1e-10)
 
-            scores = alpha[j - 1].unsqueeze(1) + log_A
+            log_alpha[j] = torch.full((self.k,), -inf)
+            for t in range(self.k):
+                if tag_j is not None and t != tag_j:
+                    continue  
+                
+                log_scores = log_alpha[j-1] + torch.log(self.A[:, t] + 1e-10) + log_emission[t]
+                
+                log_alpha[j][t] = torch.max(log_scores)
+                backpointers[j][t] = torch.argmax(log_scores).item()
 
-            alpha_j, backpointer_j = torch.max(scores, dim=0)
-
-            alpha[j] = alpha_j + emit_prob
-
-            backpointers[j] = backpointer_j
-
-        tags = [0] * len(isent)
         tags[-1] = self.eos_t
-
         for j in range(len(isent) - 1, 0, -1):
-            tags[j - 1] = backpointers[j][tags[j]]
+            tags[j-1] = backpointers[j][tags[j]]
 
-        tagged_sentence = Sentence()
-        for j in range(len(sentence)):
-            word = sentence[j][0]
-            tag_index = tags[j]
-            tag = self.tagset[tag_index]
-            tagged_sentence.append((word, tag))
-
-        return tagged_sentence
+        # Make a new tagged sentence with the old words and the chosen tags
+        # (using self.tagset to deintegerize the chosen tags).
+        return Sentence([(word, self.tagset[tags[j]]) for j, (word, tag) in enumerate(sentence)])
 
     def save(self, path: Path|str, checkpoint=None, checkpoint_interval: int = 300) -> None:
         """Save this model to the file named by path.  Or if checkpoint is not None, insert its 
