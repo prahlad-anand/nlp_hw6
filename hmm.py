@@ -303,41 +303,39 @@ class HiddenMarkovModel:
         (store some representation of them into attributes of self)
         so that they can subsequently be used by the backward pass."""
         
-        # The "nice" way to construct the sequence of vectors alpha[0],
-        # alpha[1], ...  is by appending to a List[Tensor] at each step.
-        # But to better match the notation in the handout, we'll instead
-        # preallocate a list alpha of length n+2 so that we can assign 
-        # directly to each alpha[j] in turn.
-        alpha = [torch.empty(self.k) for _ in isent]
-        alpha[0] = self.eye[self.bos_t]  # vector that is one-hot at BOS_TAG
+       
+        log_alpha = [torch.empty(self.k) for _ in isent]
+        log_alpha[0] = torch.full((self.k,), -inf)
+        log_alpha[0][self.bos_t] = 0.0
 
-            # Note: once you have this working on the ice cream data, you may
-            # have to modify this design slightly to avoid underflow on the
-            # English tagging data. See section C in the reading handout.
-
-        # Algo 1
+        #
         for j in range(1, len(isent)):
             word_j, tag_j = isent[j]
 
             if word_j >= self.V:
                 if word_j == self.V:  
-                    emission = self.eye[self.eos_t]
+                    
+                    log_emission = torch.full((self.k,), -inf)
+                    log_emission[self.eos_t] = 0.0
                 else:  
-                    emission = self.eye[self.bos_t]
+                    log_emission = torch.full((self.k,), -inf)
+                    log_emission[self.bos_t] = 0.0
             else:
-                emission = self.B[:, word_j]
+                log_emission = torch.log(self.B[:, word_j] + 1e-10)  
 
-            alpha[j] = (alpha[j-1] @ self.A) * emission
+          
+            log_alpha[j] = torch.full((self.k,), -inf)
+            for t in range(self.k):
+                if tag_j is not None and t != tag_j:
+                    continue  
+                
+                log_scores = log_alpha[j-1] + torch.log(self.A[:, t] + 1e-10) + log_emission[t]
+                log_alpha[j][t] = torch.logsumexp(log_scores, dim=0)
 
-            if tag_j is not None:
-                mask = self.eye[tag_j]
-                alpha[j] = alpha[j] * mask
+        log_Z = log_alpha[-1][self.eos_t]
 
-        Z = alpha[-1][self.eos_t]
-        log_Z = torch.log(Z)
-
-        # Store for backward pass
-        self.alpha = alpha
+        self.log_alpha = log_alpha
+        self.alpha = [torch.exp(la) for la in log_alpha]  
         self.log_Z = log_Z
 
         return log_Z
@@ -353,47 +351,66 @@ class HiddenMarkovModel:
         values and log Z, which were stored for us (in self) by the forward
         pass."""
 
-        # Pre-allocate beta just as we pre-allocated alpha.
-        beta = [torch.empty(self.k) for _ in isent]
-        beta[-1] = self.eye[self.eos_t]  # vector that is one-hot at EOS_TAG
+        log_beta = [torch.empty(self.k) for _ in isent]
+        log_beta[-1] = torch.full((self.k,), -inf)
+        log_beta[-1][self.eos_t] = 0.0
 
-        # Algo 4
-        alpha = self.alpha
-        Z = torch.exp(self.log_Z)
+        log_alpha = self.log_alpha
+        log_Z = self.log_Z
 
         for j in range(len(isent) - 1, 0, -1):
             word_j, tag_j = isent[j]
 
             if tag_j is not None:
-                possible_tags_j = [tag_j] 
+                possible_tags_j = [tag_j]
+        
+                saved_value = log_beta[j][tag_j]
+                log_beta[j] = torch.full((self.k,), -inf)
+                log_beta[j][tag_j] = saved_value
             else:
                 possible_tags_j = range(self.k)
 
             if word_j >= self.V:
                 if word_j == self.V:  
-                    emission = self.eye[self.eos_t]
+                    log_emission = torch.full((self.k,), -inf)
+                    log_emission[self.eos_t] = 0.0
                 else:  
-                    emission = self.eye[self.bos_t]
+                    log_emission = torch.full((self.k,), -inf)
+                    log_emission[self.bos_t] = 0.0
             else:
-                emission = self.B[:, word_j]
+                log_emission = torch.log(self.B[:, word_j] + 1e-10)
 
             if word_j < self.V:
-                emission_posterior = (alpha[j] * beta[j]) / Z
-                self.B_counts[:, word_j] += mult * emission_posterior
+                for t in possible_tags_j:
+                    if t == self.eos_t or t == self.bos_t:
+                        continue
+                    log_posterior = log_alpha[j][t] + log_beta[j][t] - log_Z
+                    posterior = torch.exp(torch.clamp(log_posterior, max=0))
+                    self.B_counts[t, word_j] += mult * posterior
 
-            beta[j-1] = torch.zeros(self.k)
-            for t in possible_tags_j:  # current tag
-                for s in range(self.k):  # previous tag
-                    # transition probability
-                    arc_prob = self.A[s, t] * emission[t]
+            log_beta[j-1] = torch.full((self.k,), -inf)
+            for s in range(self.k):
+                if s == self.eos_t:
+                    continue
+                    
+                log_scores = []
+                for t in possible_tags_j:
+                    if t == self.bos_t:
+                        continue
+                    log_score = torch.log(self.A[s, t] + 1e-10) + log_emission[t] + log_beta[j][t]
+                    log_scores.append(log_score)
+                
+                if log_scores:
+                    log_beta[j-1][s] = torch.logsumexp(torch.stack(log_scores), dim=0)
+                
+                for t in possible_tags_j:
+                    if t == self.bos_t:
+                        continue
+                    log_posterior = log_alpha[j-1][s] + torch.log(self.A[s, t] + 1e-10) + log_emission[t] + log_beta[j][t] - log_Z
+                    posterior = torch.exp(torch.clamp(log_posterior, max=0))
+                    self.A_counts[s, t] += mult * posterior
 
-                    transition_posterior = (alpha[j-1][s] * arc_prob * beta[j][t]) / Z
-                    self.A_counts[s, t] += mult * transition_posterior
-
-                    beta[j-1][s] += arc_prob * beta[j][t]
-
-        # backward = forward
-        log_Z_backward = torch.log(beta[0][self.bos_t])
+        log_Z_backward = log_beta[0][self.bos_t]
 
         return log_Z_backward
 
@@ -401,59 +418,41 @@ class HiddenMarkovModel:
         """Find the most probable tagging for the given sentence, according to the
         current model."""
 
-        # Note: This code is mainly copied from the forward algorithm.
-        # We just switch to using max, and follow backpointers.
-        # The code continues to use the name alpha, rather than \hat{alpha}
-        # as in the handout.
-
-        # We'll start by integerizing the input Sentence. You'll have to
-        # deintegerize the words and tags again when constructing the return
-        # value, since the type annotation on this method says that it returns a
-        # Sentence object, and that's what downstream methods like eval_tagging
-        # will expect.  (Running mypy on your code will check that your code
-        # conforms to the type annotations ...)
-
         isent = self._integerize_sentence(sentence, corpus)
 
-        # See comments in log_forward on preallocation of alpha.
-        alpha        = [torch.empty(self.k)                  for _ in isent]
+        log_alpha = [torch.empty(self.k) for _ in isent]
         backpointers = [torch.empty(self.k, dtype=torch.int) for _ in isent]
-        tags: List[int]    # you'll put your integerized tagging here
+        tags: List[int] = [0] * len(isent)
 
-        alpha[0] = self.eye[self.bos_t] 
+        log_alpha[0] = torch.full((self.k,), -inf)
+        log_alpha[0][self.bos_t] = 0.0
 
-        # Forward pass (max)
         for j in range(1, len(isent)):
             word_j, tag_j = isent[j]
 
-            # Get emission probabilities for word_j
             if word_j >= self.V:
                 if word_j == self.V:  
-                    emission = self.eye[self.eos_t]
+                    log_emission = torch.full((self.k,), -inf)
+                    log_emission[self.eos_t] = 0.0
                 else:  
-                    emission = self.eye[self.bos_t]
+                    log_emission = torch.full((self.k,), -inf)
+                    log_emission[self.bos_t] = 0.0
             else:
-                emission = self.B[:, word_j]
+                log_emission = torch.log(self.B[:, word_j] + 1e-10)
 
-            # For each possible tag at j
+            log_alpha[j] = torch.full((self.k,), -inf)
             for t in range(self.k):
-                # Find best previous tag
-                scores = alpha[j-1] * self.A[:, t] * emission[t]
+                if tag_j is not None and t != tag_j:
+                    continue  
+                
+                log_scores = log_alpha[j-1] + torch.log(self.A[:, t] + 1e-10) + log_emission[t]
+                
+                log_alpha[j][t] = torch.max(log_scores)
+                backpointers[j][t] = torch.argmax(log_scores).item()
 
-                alpha[j][t] = torch.max(scores)
-                backpointers[j][t] = torch.argmax(scores)
-
-            # If tag observed at j, zero out other tags
-            if tag_j is not None:
-                mask = self.eye[tag_j]
-                alpha[j] = alpha[j] * mask
-
-        # Backward pass
-        tags = [0] * len(isent)
         tags[-1] = self.eos_t
-
         for j in range(len(isent) - 1, 0, -1):
-            tags[j-1] = backpointers[j][tags[j]].item()
+            tags[j-1] = backpointers[j][tags[j]]
 
         # Make a new tagged sentence with the old words and the chosen tags
         # (using self.tagset to deintegerize the chosen tags).
