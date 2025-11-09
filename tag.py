@@ -9,7 +9,7 @@ import os, os.path, datetime
 from typing import Callable, Tuple, Union
 
 import torch, torch.backends.mps
-from eval import model_cross_entropy, viterbi_error_rate, write_tagging, log as eval_log
+from eval import model_cross_entropy, viterbi_error_rate, write_tagging, tagger_error_rate, log as eval_log
 from hmm import HiddenMarkovModel
 from crf import ConditionalRandomField
 # from lexicon import build_lexicon
@@ -341,6 +341,13 @@ def main() -> None:
     # Load the input data (eval corpus), using the same vocab and tagset.
     eval_corpus = TaggedCorpus(Path(args.input), tagset=model.tagset, vocab=model.vocab)
     
+    if isinstance(model, HiddenMarkovModel) and args.awesome and train_paths:
+        try:
+            model.set_allowed_tags_from_supervised(train_corpus)
+            eval_log.info("used --awesome.")
+        except Exception as e:
+            log.warning(f"Error: {e}")
+    
     # Construct the primary loss function on the eval corpus.
     # This will be monitored throughout training and used for early stopping.
     loss = lambda x: model_cross_entropy(x, eval_corpus)
@@ -390,12 +397,23 @@ def main() -> None:
     with torch.inference_mode():   # turn off all gradient tracking
         # Run the model on the input data (eval corpus).
         if args.output_file:
-            write_tagging(model, eval_corpus, Path(args.output_file))
+            if isinstance(model, HiddenMarkovModel) and args.awesome:
+                def posterior_tagger(input_sentence):
+                    return model.posterior_decode(input_sentence, eval_corpus)
+                write_tagging(posterior_tagger, eval_corpus, Path(args.output_file))
+            else:
+                write_tagging(model, eval_corpus, Path(args.output_file))
             eval_log.info(f"Wrote tagging to {args.output_file}")
 
         # Show how well we did on the input data.  
-        loss(model)         # show the main loss function (using the logger) -- redundant if we trained
-        other_loss(model)   # show the other loss function (using the logger)
+        if isinstance(model, HiddenMarkovModel) and args.awesome:
+            model_cross_entropy(model, eval_corpus)
+            def posterior_tagger(input_sentence):
+                return model.posterior_decode(input_sentence, eval_corpus)
+            tagger_error_rate(posterior_tagger, eval_corpus, known_vocab=known_vocab or train_corpus.vocab)
+        else:
+            loss(model)         # show the main loss function (using the logger) -- redundant if we trained
+            other_loss(model)   # show the other loss function (using the logger)
         eval_log.info("===")
     
 if __name__ == "__main__":
