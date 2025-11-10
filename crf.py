@@ -224,36 +224,48 @@ class ConditionalRandomField(HiddenMarkovModel):
         """Computes log Z, the log-probability of observing the given sentence 
         under the model's parameters, using the forward algorithm.
         """
-        n = len(sent) - 2  # number of words, excluding BOS and EOS
+        n = len(sent)
+        k = self.k
 
-        # Initialize alpha to be -inf for all tags, except the BOS tag
-        alpha = torch.full((len(sent), self.k), -float('inf'))
-        alpha[0][self.bos_t] = 0  # Start with BOS tag having log-prob of 0
+        log_pA = torch.log(self.A + 1e-10)
+        log_pB = torch.log(self.B + 1e-10)
 
-        # Forward algorithm over each word in the sentence
-        for j in range(1, n + 1):
-            word = sent[j][0]
-            tag = sent[j][1]
+        log_alpha = torch.full((n, k), float('-inf'))
+        log_alpha[0, self.bos_t] = 0.0
 
-            if tag is None:  # Unsupervised, consider all possible tags
-                alpha[j] = torch.logsumexp(
-                    alpha[j - 1].unsqueeze(1) + torch.log(self.A) + torch.log(self.B[:, word]).unsqueeze(0) + torch.log(self.B[:, word]).unsqueeze(0),
-                    dim=0
-                )
-            else:  # Supervised, update only the observed tag
-                alpha[j][tag] = torch.logsumexp(
-                    alpha[j - 1] + torch.log(self.A[:, tag]) + torch.log(self.B[tag, word]),
-                    dim=0
-                )
+        tau_mask = torch.ones((n, k), dtype=torch.bool)
+        for j in range(n):
+            if sent[j][1] is not None:
+                t_j = sent[j][1]
+                tau_mask[j] = False
+                tau_mask[j, t_j] = True
 
-        # Compute for EOS tag
-        alpha[n + 1][self.eos_t] = torch.logsumexp(
-            alpha[n] + torch.log(self.A[:, self.eos_t]), dim=0
-        )
+        log_pB_wj = torch.full((n, k), float('-inf'))
+        for j in range(n):
+            w_j = sent[j][0]
+            if w_j < self.V:
+                log_pB_wj[j] = log_pB[:, w_j]
+            else:
+                if w_j == self.vocab.index(BOS_WORD):
+                    log_pB_wj[j, self.bos_t] = 0.0
+                elif w_j == self.vocab.index(EOS_WORD):
+                    log_pB_wj[j, self.eos_t] = 0.0
 
-        # Return the final log-probability
-        Z = alpha[n + 1][self.eos_t]
-        return Z
+        log_pB_wj[~tau_mask] = float('-inf')
+
+        for j in range(1, n):
+            prev_alpha = log_alpha[j - 1].unsqueeze(1)
+            scores = prev_alpha + log_pA
+            scores += log_pB_wj[j].unsqueeze(0)
+
+            mask = tau_mask[j - 1].unsqueeze(1) & tau_mask[j].unsqueeze(0)
+            scores[~mask] = float('-inf')
+
+            log_alpha[j] = torch.logsumexp(scores, dim=0)
+            log_alpha[j][~tau_mask[j]] = float('-inf')
+
+        log_Z = log_alpha[-1, self.eos_t]
+        return log_Z
 
     def accumulate_logprob_gradient(self, sentence: Sentence, corpus: TaggedCorpus) -> None:
         """Add the gradient of self.logprob(sentence, corpus) into a total minibatch
