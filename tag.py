@@ -386,6 +386,59 @@ def main() -> None:
         # they were provided: we happen to be training on 0 files this time,
         # that's all!
         pass  
+    
+    
+    if args.awesome:
+        try: 
+            word_to_allowed_tags = {}  
+            if train_corpus:
+                for sentence in train_corpus:
+                    for (word, tag) in sentence:
+                        if tag is None:
+                            continue
+                        w_idx = train_corpus.integerize_word(word)
+
+                        if w_idx is None or w_idx >= len(model.vocab) - 2 or w_idx >= model.V:
+                            continue
+                        try:
+                            t_idx = train_corpus.integerize_tag(tag)
+                        except KeyError:
+                            continue
+                        if t_idx is None:
+                            continue
+                        tags = word_to_allowed_tags.get(w_idx)
+                        if tags is None:
+                            tags = set()
+                            word_to_allowed_tags[w_idx] = tags
+                        tags.add(t_idx)
+            else:
+                eval_log.warning("add training corpus")
+            
+            if word_to_allowed_tags:
+                allowed_mask = _torch.ones((model.k, model.V), dtype=_torch.bool, device=model.B.device)  
+                for w_idx, tag_set in word_to_allowed_tags.items():
+                    if 0 <= w_idx < model.V:
+                        allowed_mask[:, w_idx] = False
+                        for t_idx in tag_set:
+                            if 0 <= t_idx < model.k:
+                                allowed_mask[t_idx, w_idx] = True
+
+                B_new = model.B.clone()
+                B_new = B_new * allowed_mask.to(dtype=B_new.dtype)
+                B_new[model.bos_t, :] = 0  
+                B_new[model.eos_t, :] = 0  
+
+                if not isinstance(model, ConditionalRandomField):
+                    eps = 1e-15
+                    denom = B_new.sum(dim=1, keepdim=True) + eps
+                    B_new = B_new / denom  
+                    B_new[model.bos_t, :] = 0  
+                    B_new[model.eos_t, :] = 0  
+                model.B = B_new
+            else: 
+                eval_log.warning("add training corpus")
+        except Exception as e:
+            eval_log.warning(f"Error: {e}")
                      
     with torch.inference_mode():   # turn off all gradient tracking
         # Run the model on the input data (eval corpus).
