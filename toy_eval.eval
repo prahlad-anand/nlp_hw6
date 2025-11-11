@@ -1,0 +1,39 @@
+Cross-entropy: 1.6026 nats (= perplexity 4.966)
+Cross-entropy: 0.2747 nats (= perplexity 1.316)
+Cross-entropy: 0.2747 nats (= perplexity 1.316)
+Wrote tagging to toy_eval_output
+Cross-entropy: 0.2747 nats (= perplexity 1.316)
+Tagging accuracy: all: nan%, known: nan%, seen: nan%, novel: nan%
+===
+Cross-entropy: -0.0000 nats (= perplexity 1.000)
+Cross-entropy: -0.0000 nats (= perplexity 1.000)
+Wrote tagging to toy_eval_output
+Cross-entropy: -0.0000 nats (= perplexity 1.000)
+Tagging accuracy: all: nan%, known: nan%, seen: nan%, novel: nan%
+===
+Cross-entropy: 1.6026 nats (= perplexity 4.966)
+Cross-entropy: 0.2747 nats (= perplexity 1.316)
+Cross-entropy: 0.2747 nats (= perplexity 1.316)
+Wrote tagging to toy_eval_output
+Cross-entropy: 0.2747 nats (= perplexity 1.316)
+Tagging accuracy: all: nan%, known: nan%, seen: nan%, novel: nan%
+===
+Cross-entropy: -0.0000 nats (= perplexity 1.000)
+Cross-entropy: -0.0000 nats (= perplexity 1.000)
+Wrote tagging to toy_eval_output
+Cross-entropy: -0.0000 nats (= perplexity 1.000)
+Tagging accuracy: all: nan%, known: nan%, seen: nan%, novel: nan%
+===
+Cross-entropy: 1.6026 nats (= perplexity 4.966)
+Cross-entropy: 0.2747 nats (= perplexity 1.316)
+Cross-entropy: 0.2747 nats (= perplexity 1.316)
+Wrote tagging to toy_eval_output
+Cross-entropy: 0.2747 nats (= perplexity 1.316)
+Tagging accuracy: all: nan%, known: nan%, seen: nan%, novel: nan%
+===
+Cross-entropy: -0.0000 nats (= perplexity 1.000)
+Cross-entropy: -0.0000 nats (= perplexity 1.000)
+Wrote tagging to toy_eval_output
+Cross-entropy: -0.0000 nats (= perplexity 1.000)
+Tagging accuracy: all: nan%, known: nan%, seen: nan%, novel: nan%
+===

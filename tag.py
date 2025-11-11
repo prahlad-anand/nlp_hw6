@@ -15,6 +15,8 @@ from crf import ConditionalRandomField
 # from lexicon import build_lexicon
 from corpus import TaggedCorpus
 
+log = logging.getLogger(Path(__file__).stem)  
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
 
@@ -242,9 +244,11 @@ def parse_args() -> argparse.Namespace:
         if not args.eval_file:
             args.eval_file = resultname + ".eval"
     if not args.output_file:
-        log.warning(f"Warning: won't save tagging output (use --output_file for that)")
+        base = os.path.splitext(os.path.basename(args.input))[0]
+        args.output_file = f"{base}_output"
     if not args.eval_file:
-        log.warning(f"Warning: won't save evaluation messages (use --eval_file for that)")      
+        base = os.path.splitext(os.path.basename(args.input))[0]
+        args.eval_file = f"{base}.eval"
 
     # What kind of model should we create?  Store it in args.new_model_class.
     if args.load_path:      # don't need to create a new model
@@ -256,9 +260,8 @@ def parse_args() -> argparse.Namespace:
             args.new_model_class = HiddenMarkovModel
     else:                   # create some sort of CRF
         if args.rnn_dim or args.lexicon or args.problex:
-            args.new_model_class = ConditionalRandomFieldNeural
-        else: 
-            args.new_model_class = ConditionalRandomField          
+            log.warning("fallback to simple CRF")
+        args.new_model_class = ConditionalRandomField          
 
     return args
 
@@ -311,32 +314,8 @@ def main() -> None:
         # Build a new model of the required class from scratch, building vocab/tagset from training corpus.
         assert new_model_class is not None
         train_corpus = TaggedCorpus(*train_paths)
-        if not issubclass(new_model_class, ConditionalRandomFieldNeural):
-            # simple case
-            model = new_model_class(train_corpus.tagset, train_corpus.vocab, 
-                                    unigram=args.unigram)
-        else:
-            # For a neural model, we have to call the constructor with extra arguments.
-            # We start by making a lexicon of word embeddings.
-            if args.lexicon:
-                # The user gave us a file of pretrained lexical embeddings.
-                known_vocab = train_corpus.vocab   # save training vocab, since it may be replaced
-                lexicon = build_lexicon(train_corpus, 
-                                        embeddings_file=Path(args.lexicon) if args.lexicon else None, 
-                                        newvocab=TaggedCorpus(Path(args.input)).vocab,  # add only eval words from file
-                                        problex=args.problex)
-            else:
-                # No lexicon was specified, so default to simpler embeddings of the training words.
-                if args.problex:
-                    lexicon = build_lexicon(train_corpus, problex=args.problex)
-                else:
-                    # Simple one-hot embeddings are our final fallback if nothing else was specified.
-                    lexicon = build_lexicon(train_corpus, one_hot=True)
-
-            # Now create the model.
-            model = new_model_class(train_corpus.tagset, train_corpus.vocab, 
-                                    rnn_dim=(args.rnn_dim or 0), lexicon=lexicon,   # neural model args
-                                    unigram=args.unigram)
+        model = new_model_class(train_corpus.tagset, train_corpus.vocab, 
+                                unigram=args.unigram)
     
     # Load the input data (eval corpus), using the same vocab and tagset.
     eval_corpus = TaggedCorpus(Path(args.input), tagset=model.tagset, vocab=model.vocab)
@@ -390,6 +369,7 @@ def main() -> None:
     
     if args.awesome:
         try: 
+            import torch as _torch
             word_to_allowed_tags = {}  
             if train_corpus:
                 for sentence in train_corpus:
