@@ -9,11 +9,13 @@ import os, os.path, datetime
 from typing import Callable, Tuple, Union
 
 import torch, torch.backends.mps
-from eval import model_cross_entropy, viterbi_error_rate, write_tagging, tagger_error_rate, log as eval_log
+from eval import model_cross_entropy, viterbi_error_rate, write_tagging, log as eval_log
 from hmm import HiddenMarkovModel
 from crf import ConditionalRandomField
 # from lexicon import build_lexicon
 from corpus import TaggedCorpus
+
+log = logging.getLogger(Path(__file__).stem)  
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -242,9 +244,11 @@ def parse_args() -> argparse.Namespace:
         if not args.eval_file:
             args.eval_file = resultname + ".eval"
     if not args.output_file:
-        log.warning(f"Warning: won't save tagging output (use --output_file for that)")
+        base = os.path.splitext(os.path.basename(args.input))[0]
+        args.output_file = f"{base}_output"
     if not args.eval_file:
-        log.warning(f"Warning: won't save evaluation messages (use --eval_file for that)")      
+        base = os.path.splitext(os.path.basename(args.input))[0]
+        args.eval_file = f"{base}.eval"
 
     # What kind of model should we create?  Store it in args.new_model_class.
     if args.load_path:      # don't need to create a new model
@@ -256,9 +260,8 @@ def parse_args() -> argparse.Namespace:
             args.new_model_class = HiddenMarkovModel
     else:                   # create some sort of CRF
         if args.rnn_dim or args.lexicon or args.problex:
-            args.new_model_class = ConditionalRandomFieldNeural
-        else: 
-            args.new_model_class = ConditionalRandomField          
+            log.warning("fallback to simple CRF")
+        args.new_model_class = ConditionalRandomField          
 
     return args
 
@@ -311,42 +314,11 @@ def main() -> None:
         # Build a new model of the required class from scratch, building vocab/tagset from training corpus.
         assert new_model_class is not None
         train_corpus = TaggedCorpus(*train_paths)
-        if not issubclass(new_model_class, ConditionalRandomFieldNeural):
-            # simple case
-            model = new_model_class(train_corpus.tagset, train_corpus.vocab, 
-                                    unigram=args.unigram)
-        else:
-            # For a neural model, we have to call the constructor with extra arguments.
-            # We start by making a lexicon of word embeddings.
-            if args.lexicon:
-                # The user gave us a file of pretrained lexical embeddings.
-                known_vocab = train_corpus.vocab   # save training vocab, since it may be replaced
-                lexicon = build_lexicon(train_corpus, 
-                                        embeddings_file=Path(args.lexicon) if args.lexicon else None, 
-                                        newvocab=TaggedCorpus(Path(args.input)).vocab,  # add only eval words from file
-                                        problex=args.problex)
-            else:
-                # No lexicon was specified, so default to simpler embeddings of the training words.
-                if args.problex:
-                    lexicon = build_lexicon(train_corpus, problex=args.problex)
-                else:
-                    # Simple one-hot embeddings are our final fallback if nothing else was specified.
-                    lexicon = build_lexicon(train_corpus, one_hot=True)
-
-            # Now create the model.
-            model = new_model_class(train_corpus.tagset, train_corpus.vocab, 
-                                    rnn_dim=(args.rnn_dim or 0), lexicon=lexicon,   # neural model args
-                                    unigram=args.unigram)
+        model = new_model_class(train_corpus.tagset, train_corpus.vocab, 
+                                unigram=args.unigram)
     
     # Load the input data (eval corpus), using the same vocab and tagset.
     eval_corpus = TaggedCorpus(Path(args.input), tagset=model.tagset, vocab=model.vocab)
-    
-    if isinstance(model, HiddenMarkovModel) and args.awesome and train_paths:
-        try:
-            model.set_allowed_tags_from_supervised(train_corpus)
-            eval_log.info("used --awesome.")
-        except Exception as e:
-            log.warning(f"Error: {e}")
     
     # Construct the primary loss function on the eval corpus.
     # This will be monitored throughout training and used for early stopping.
@@ -393,29 +365,71 @@ def main() -> None:
         # they were provided: we happen to be training on 0 files this time,
         # that's all!
         pass  
+    
+    
+    if args.awesome:
+        try: 
+            import torch as _torch
+            word_to_allowed_tags = {}  
+            if train_corpus:
+                for sentence in train_corpus:
+                    for (word, tag) in sentence:
+                        if tag is None:
+                            continue
+                        w_idx = train_corpus.integerize_word(word)
+
+                        if w_idx is None or w_idx >= len(model.vocab) - 2 or w_idx >= model.V:
+                            continue
+                        try:
+                            t_idx = train_corpus.integerize_tag(tag)
+                        except KeyError:
+                            continue
+                        if t_idx is None:
+                            continue
+                        tags = word_to_allowed_tags.get(w_idx)
+                        if tags is None:
+                            tags = set()
+                            word_to_allowed_tags[w_idx] = tags
+                        tags.add(t_idx)
+            else:
+                eval_log.warning("add training corpus")
+            
+            if word_to_allowed_tags:
+                allowed_mask = _torch.ones((model.k, model.V), dtype=_torch.bool, device=model.B.device)  
+                for w_idx, tag_set in word_to_allowed_tags.items():
+                    if 0 <= w_idx < model.V:
+                        allowed_mask[:, w_idx] = False
+                        for t_idx in tag_set:
+                            if 0 <= t_idx < model.k:
+                                allowed_mask[t_idx, w_idx] = True
+
+                B_new = model.B.clone()
+                B_new = B_new * allowed_mask.to(dtype=B_new.dtype)
+                B_new[model.bos_t, :] = 0  
+                B_new[model.eos_t, :] = 0  
+
+                if not isinstance(model, ConditionalRandomField):
+                    eps = 1e-15
+                    denom = B_new.sum(dim=1, keepdim=True) + eps
+                    B_new = B_new / denom  
+                    B_new[model.bos_t, :] = 0  
+                    B_new[model.eos_t, :] = 0  
+                model.B = B_new
+            else: 
+                eval_log.warning("add training corpus")
+        except Exception as e:
+            eval_log.warning(f"Error: {e}")
                      
     with torch.inference_mode():   # turn off all gradient tracking
         # Run the model on the input data (eval corpus).
         if args.output_file:
-            if isinstance(model, HiddenMarkovModel) and args.awesome:
-                def posterior_tagger(input_sentence):
-                    return model.posterior_decode(input_sentence, eval_corpus)
-                write_tagging(posterior_tagger, eval_corpus, Path(args.output_file))
-            else:
-                write_tagging(model, eval_corpus, Path(args.output_file))
+            write_tagging(model, eval_corpus, Path(args.output_file))
             eval_log.info(f"Wrote tagging to {args.output_file}")
 
         # Show how well we did on the input data.  
-        if isinstance(model, HiddenMarkovModel) and args.awesome:
-            model_cross_entropy(model, eval_corpus)
-            def posterior_tagger(input_sentence):
-                return model.posterior_decode(input_sentence, eval_corpus)
-            tagger_error_rate(posterior_tagger, eval_corpus, known_vocab=known_vocab or train_corpus.vocab)
-        else:
-            loss(model)         # show the main loss function (using the logger) -- redundant if we trained
-            other_loss(model)   # show the other loss function (using the logger)
+        loss(model)         # show the main loss function (using the logger) -- redundant if we trained
+        other_loss(model)   # show the other loss function (using the logger)
         eval_log.info("===")
     
 if __name__ == "__main__":
     main()
-

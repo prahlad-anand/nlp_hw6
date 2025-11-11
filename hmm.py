@@ -72,7 +72,6 @@ class HiddenMarkovModel:
 
         self.tagset = tagset
         self.vocab = vocab
-        self.allowed_tags_by_word: Optional[Tensor] = None
 
         # Useful constants that are referenced by the methods
         self.bos_t: Optional[int] = tagset.index(BOS_TAG)
@@ -175,31 +174,6 @@ class HiddenMarkovModel:
         # See the init_params() method for a discussion of self.A in the
         # unigram case.
         
-    def set_allowed_tags_from_supervised(self, corpus):
-        tag_sets_by_word: list[set[int]] = [set() for _ in range(self.V)]
-
-        for sentence in corpus.get_sentences():
-            for (word, tag) in sentence[1:-1]:
-                if tag is None:
-                    continue
-                w = corpus.integerize_word(word)
-                if w >= self.V:
-                    continue  
-                t = corpus.integerize_tag(tag)
-                tag_sets_by_word[w].add(t)
-
-        allowed = torch.ones(self.k, self.V, dtype=torch.bool)
-
-        for w, tagset in enumerate(tag_sets_by_word):
-            if not tagset:
-                continue
-            allowed[:, w] = False
-            
-            for t in tagset:
-                allowed[t, w] = True
-
-        self.allowed_tags_by_word = allowed
-
 
     def _zero_counts(self):
         """Set the expected counts to 0.  
@@ -350,9 +324,6 @@ class HiddenMarkovModel:
             w_j = isent[j][0]
             if w_j < self.V:
                 log_pB_wj[j] = log_pB[:, w_j]
-                if self.allowed_tags_by_word is not None:
-                    allowed = self.allowed_tags_by_word[:, w_j]
-                    log_pB_wj[j][~allowed] = float('-inf')
             else:
                 if w_j == self.vocab.index(BOS_WORD):
                     log_pB_wj[j, self.bos_t] = 0.0
@@ -413,9 +384,6 @@ class HiddenMarkovModel:
             w_j = isent[j][0]
             if w_j < self.V:
                 log_pB_wj[j] = log_pB[:, w_j]
-                if self.allowed_tags_by_word is not None:
-                    allowed = self.allowed_tags_by_word[:, w_j]
-                    log_pB_wj[j][~allowed] = float('-inf')
             else:
                 if w_j == self.vocab.index(BOS_WORD):
                     log_pB_wj[j, self.bos_t] = 0.0
@@ -446,11 +414,10 @@ class HiddenMarkovModel:
 
             xi_probs = torch.exp(xi_scores)  
 
-            if mult != 0:
-                self.A_counts += xi_probs * mult
-                w_jp1 = isent[j + 1][0]
-                if w_jp1 < self.V:
-                    self.B_counts[:, w_jp1] += xi_probs.sum(dim=0) * mult
+            self.A_counts += xi_probs * mult
+            w_jp1 = isent[j + 1][0]
+            if w_jp1 < self.V:
+                self.B_counts[:, w_jp1] += xi_probs.sum(dim=0) * mult
 
         log_Z_backward = log_beta[0, self.bos_t]
         return log_Z_backward
@@ -474,10 +441,6 @@ class HiddenMarkovModel:
             w_j = isent[j][0]
             if w_j < self.V:
                 emit_prob = log_B[:, w_j]
-                if self.allowed_tags_by_word is not None:
-                    allowed = self.allowed_tags_by_word[:, w_j]
-                    emit_prob = emit_prob.clone()
-                    emit_prob[~allowed] = float('-inf')
             else:
                 emit_prob = torch.zeros(k)
 
@@ -503,63 +466,6 @@ class HiddenMarkovModel:
             tagged_sentence.append((word, tag))
 
         return tagged_sentence
-
-    def posterior_decode(self, sentence, corpus):
-        isent = self._integerize_sentence(sentence, corpus)
-
-        _ = self.forward_pass(isent)
-
-        n = len(isent)
-        k = self.k
-        log_pA = torch.log(self.A + 1e-10)
-        log_pB = torch.log(self.B + 1e-10)
-        log_beta = torch.full((n, k), float('-inf'))
-        log_beta[-1, self.eos_t] = 0.0
-
-        tau_mask = torch.ones((n, k), dtype=torch.bool)
-        for j in range(n):
-            if isent[j][1] is not None:
-                t_j = isent[j][1]
-                tau_mask[j] = False
-                tau_mask[j, t_j] = True
-
-        log_pB_wj = torch.full((n, k), float('-inf'))
-        for j in range(n):
-            w_j = isent[j][0]
-            if w_j < self.V:
-                log_pB_wj[j] = log_pB[:, w_j]
-                if self.allowed_tags_by_word is not None:
-                    allowed = self.allowed_tags_by_word[:, w_j]
-                    log_pB_wj[j][~allowed] = float('-inf')
-            else:
-                if w_j == self.vocab.index(BOS_WORD):
-                    log_pB_wj[j, self.bos_t] = 0.0
-                elif w_j == self.vocab.index(EOS_WORD):
-                    log_pB_wj[j, self.eos_t] = 0.0
-
-        log_pB_wj[~tau_mask] = float('-inf')
-
-        for j in range(n - 2, -1, -1):
-            next_beta = log_beta[j + 1]
-            next_beta[~tau_mask[j + 1]] = float('-inf')
-            scores = log_pA + log_pB_wj[j + 1].unsqueeze(0) + next_beta.unsqueeze(0)
-            mask = tau_mask[j].unsqueeze(1) & tau_mask[j + 1].unsqueeze(0)
-            scores[~mask] = float('-inf')
-            log_beta[j] = torch.logsumexp(scores, dim=1)
-            log_beta[j][~tau_mask[j]] = float('-inf')
-
-        tagged = Sentence()
-        for j in range(len(sentence)):
-            word = sentence[j][0]
-            if j == 0 or j == len(sentence) - 1:
-                tagged.append((word, sentence[j][1]))
-                continue
-            post = self.log_alpha[j] + log_beta[j] - self.log_Z
-            tag_index = int(torch.argmax(post).item())
-            tag = self.tagset[tag_index]
-            tagged.append((word, tag))
-            
-        return tagged
 
     def save(self, path: Path|str, checkpoint=None, checkpoint_interval: int = 300) -> None:
         """Save this model to the file named by path.  Or if checkpoint is not None, insert its 

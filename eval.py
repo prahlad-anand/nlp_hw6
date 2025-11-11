@@ -22,6 +22,11 @@ def viterbi_tagger(model: HiddenMarkovModel, eval_corpus: TaggedCorpus) -> Calla
         return model.viterbi_tagging(input, eval_corpus)
     return tagger
 
+def posterior_tagger(model: HiddenMarkovModel, eval_corpus: TaggedCorpus) -> Callable[[Sentence], Sentence]:
+    def tagger(input: Sentence) -> Sentence:
+        return model.posterior_tagging(input, eval_corpus)
+    return tagger
+
 def model_cross_entropy(model: HiddenMarkovModel,
                         eval_corpus: TaggedCorpus) -> float:
     """Return cross-entropy per token of the model on the given evaluation corpus.
@@ -40,13 +45,27 @@ def viterbi_error_rate(model: HiddenMarkovModel,
                      eval_corpus: TaggedCorpus,
                      known_vocab: Optional[Integerizer[Word]] = None,
                      show_cross_entropy = True) -> float:
-    """Return the error rate of Viterbi tagging with the given model on the given 
-    evaluation corpus, after logging cross-entropy (optionally) and a breakdown 
+    """Return the error rate of Viterbi tagging with the given model on the given
+    evaluation corpus, after logging cross-entropy (optionally) and a breakdown
     of accuracy."""
 
     if show_cross_entropy:
         model_cross_entropy(model, eval_corpus)  # call this for its side effect (logging)
     return tagger_error_rate(viterbi_tagger(model, eval_corpus),
+                             eval_corpus,
+                             known_vocab=known_vocab)
+
+def posterior_error_rate(model: HiddenMarkovModel,
+                     eval_corpus: TaggedCorpus,
+                     known_vocab: Optional[Integerizer[Word]] = None,
+                     show_cross_entropy = True) -> float:
+    """Return the error rate of posterior tagging with the given model on the given
+    evaluation corpus, after logging cross-entropy (optionally) and a breakdown
+    of accuracy."""
+
+    if show_cross_entropy:
+        model_cross_entropy(model, eval_corpus)  # call this for its side effect (logging)
+    return tagger_error_rate(posterior_tagger(model, eval_corpus),
                              eval_corpus,
                              known_vocab=known_vocab)
 
